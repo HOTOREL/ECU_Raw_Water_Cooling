@@ -145,7 +145,7 @@ enum CalState { CAL_OK, CAL_DEFAULT_RECOMMENDED, CAL_ERROR };
 CalState calState = CAL_DEFAULT_RECOMMENDED;
 
 // ============ NVS layout (robust: magic + version + crc) ============
-static const uint32_t CAL_MAGIC = 0xECUCA1B0;
+static const uint32_t CAL_MAGIC = 0xEC0CA1B0;
 static const uint16_t CAL_VER   = 1;
 
 struct CalBlob {
