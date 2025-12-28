@@ -139,6 +139,9 @@ bool  hasLastGoodInRam = false;
 // Calibration result reporting
 bool calibLastOk = true;
 String calibLastMsg = "OK";
+bool calibFailLatched = false;
+bool calibFailOneShot = false;
+uint32_t calibFailSerial = 0;
 
 // Calibration status classification:
 enum CalState { CAL_OK, CAL_DEFAULT_RECOMMENDED, CAL_ERROR };
@@ -493,7 +496,8 @@ async function refresh(){
     statusMsg.classList.add(d.statusClass || "ok");
 
     calStatus.textContent = d.calMsg || "OK";
-    calStatus.className = "mono " + (d.calOk ? "ok" : "warn");
+    const calClass = d.calFail ? "error" : (d.calOk ? "ok" : "warn");
+    calStatus.className = "mono " + calClass;
 
     modeSwitch.checked = d.autoMode ? false : true;
 
@@ -527,6 +531,11 @@ async function refresh(){
     muteBtn.textContent = d.alarmMuted ? "Unmute Alarm" : "Mute Alarm";
 
     calibBtn.textContent = d.calibrating ? "Calibrating..." : "Calibrate";
+
+    if (d.calFailNotice) {
+      const reason = d.calFailMsg || d.calMsg || "unknown reason";
+      alert(`Calibration failed: ${reason}. Defaults restored. Please check flow sensor/pump and retry.`);
+    }
 
   }catch(e){}
 }
@@ -586,6 +595,8 @@ void handleData() {
 
   float fHz = flowHz_x100 / 100.0f;
   float rHz = rpmHz_x100  / 100.0f;
+  bool calFailNotice = calibFailOneShot;
+  calibFailOneShot = false;
 
   // status string
   String status = "OK";
@@ -623,8 +634,15 @@ void handleData() {
 
   // calibration message
   String calMsg;
+  String calFailMsg;
   bool calOk = true;
-  if (calState == CAL_OK) {
+  bool calError = false;
+  if (calibFailLatched) {
+    calFailMsg = calibLastMsg;
+    calMsg = "Default calibration in use – calibration is recommended";
+    calOk = false;
+    calError = true;
+  } else if (calState == CAL_OK) {
     calMsg = "OK";
     calOk = true;
   } else if (calState == CAL_DEFAULT_RECOMMENDED) {
@@ -669,6 +687,11 @@ void handleData() {
 
   json += "\"calOk\":" + String(calOk ? "true" : "false") + ",";
   json += "\"calMsg\":\"" + calMsg + "\",";
+  json += "\"calFail\":" + String(calibFailLatched ? "true" : "false") + ",";
+  json += "\"calFailMsg\":\"" + (calFailMsg.length() ? calFailMsg : calMsg) + "\",";
+  json += "\"calFailNotice\":" + String(calFailNotice ? "true" : "false") + ",";
+  json += "\"calFailSerial\":" + String(calFailSerial) + ",";
+  json += "\"calError\":" + String(calError ? "true" : "false") + ",";
 
   json += "\"status\":\"" + status + "\",";
   json += "\"statusClass\":\"" + statusClass + "\"";
@@ -741,6 +764,8 @@ void handleCalibrate() {
 
   calibLastOk = true;
   calibLastMsg = "Calibrating...";
+  calibFailLatched = false;
+  calibFailOneShot = false;
   setAlarmSilenced(true);
 
   server.send(200, "text/plain; charset=utf-8", "CALIBRATION_STARTED");
@@ -901,20 +926,26 @@ void updateCalibration() {
 
     calibLastOk = true;
     calibLastMsg = "Calibration OK (saved)";
+    calibFailLatched = false;
+    calibFailOneShot = false;
 
     for (int i = 0; i < CAL_STEPS; i++) calFlowLmin_lastGood[i] = calFlowLmin[i];
     hasLastGoodInRam = true;
   } else {
-    // revert to last good table in RAM
-    if (hasLastGoodInRam) {
-      for (int i = 0; i < CAL_STEPS; i++) calFlowLmin[i] = calFlowLmin_lastGood[i];
-    }
+    // revert to defaults to avoid persisting invalid calibration
+    for (int i = 0; i < CAL_STEPS; i++) calFlowLmin[i] = DEFAULT_CAL_FLOW_LMIN[i];
+    for (int i = 0; i < CAL_STEPS; i++) calFlowLmin_lastGood[i] = calFlowLmin[i];
+    hasLastGoodInRam = true;
 
-    // Keep calState as-is, but show warning
+    calibrateComplete = true;
+    calState = CAL_DEFAULT_RECOMMENDED;
     calWarningLevel1 = true;
 
     calibLastOk = false;
-    calibLastMsg = "Calibration FAILED (" + why + ") kept old";
+    calibLastMsg = "Calibration FAILED (" + why + ") — defaults restored";
+    calibFailLatched = true;
+    calibFailOneShot = true;
+    calibFailSerial++;
   }
 
   calibrating = false;
