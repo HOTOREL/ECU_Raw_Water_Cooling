@@ -23,14 +23,14 @@
 // Flow sensor label: F(Hz) = 5.5 * Q(L/min)  => Q = Hz / 5.5
 const float FLOW_K_HZ_PER_LMIN = 5.5f;
 
-// Hall RPM: 2 magnets on crank => 2 pulses per revolution (ONE edge counted)
+// Hall RPM: 2 magnets on crank => 2 pulses per revolution (counting ONE edge only)
 const float RPM_PULSES_PER_REV = 2.0f;
 
 // Prius engine running threshold (edit here if needed)
-const int ENGINE_RPM_MIN = 800;
+const int ENGINE_RPM_MIN = 800;  // <<<<< change this if needed
 
 // ===== Pump command mapping =====
-const int PUMP_PWM_MIN = 35;      // minimum command when pump should be on
+const int PUMP_PWM_MIN = 35;      // minimum command when pump should be on (you can tune later)
 const int PUMP_PWM_MAX = 99;
 const int PUMP_RPM_MAX = 5000;
 
@@ -64,7 +64,7 @@ const uint32_t MUTE_MS = 5UL * 60UL * 1000UL;  // 5 minutes
 
 // ===== Calibration validation thresholds =====
 const float CAL_MIN_REAL_FLOW_LMIN = 2.0f;     // at least some steps must exceed this
-const float CAL_MIN_SPREAD_LMIN    = 3.0f;     // last - first must be >= this (rough sanity)
+const float CAL_MIN_SPREAD_LMIN    = 3.0f;     // max-min must be >= this
 const int   CAL_MIN_GOOD_POINTS    = 3;        // how many steps must show "real flow"
 const int   CAL_MAX_BAD_DECREASES  = 2;        // allow small noise, but not many decreases
 const float CAL_DECREASE_TOL_LMIN  = 0.7f;     // decreases smaller than this are ignored
@@ -119,18 +119,20 @@ uint32_t flowUnexpectedSince = 0;
 // Pump boost
 bool boostActive = false;
 
-// Calibration table
+// ================= Calibration table =================
 const int CAL_STEPS = 9;
 int   calPwmStep[CAL_STEPS] = {20,30,40,50,60,70,80,90,100};
 float calFlowLmin[CAL_STEPS];
-bool  calibrateComplete = false;
-bool  calibrating = false;
-int   calStepIndex = -1;
-uint32_t calStepStart = 0;
-float  calStepAccumFlow = 0.0f;
-uint32_t calStepAccumCount = 0;
 
-// Keep last known-good calibration so bad calibration doesn't overwrite it
+// Built-in default calibration (dummy safe placeholders; replace later with your real “factory defaults”)
+float DEFAULT_CAL_FLOW_LMIN[CAL_STEPS] = {
+  0.5f, 1.2f, 2.1f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f
+};
+
+bool  calibrateComplete = false;      // “valid and usable for restriction logic”
+bool  calibrating = false;
+
+// keep last known-good calibration in RAM to prevent bad calibration overwrite
 float calFlowLmin_lastGood[CAL_STEPS];
 bool  hasLastGoodInRam = false;
 
@@ -138,14 +140,41 @@ bool  hasLastGoodInRam = false;
 bool calibLastOk = true;
 String calibLastMsg = "OK";
 
-// Default calibration table in firmware (PLACEHOLDER for now; fill tomorrow)
-float DEFAULT_CAL_FLOW_LMIN[CAL_STEPS] = {
-  0,0,0,0,0,0,0,0,0
+// Calibration status classification:
+enum CalState { CAL_OK, CAL_DEFAULT_RECOMMENDED, CAL_ERROR };
+CalState calState = CAL_DEFAULT_RECOMMENDED;
+
+// ============ NVS layout (robust: magic + version + crc) ============
+static const uint32_t CAL_MAGIC = 0xECUCA1B0;
+static const uint16_t CAL_VER   = 1;
+
+struct CalBlob {
+  uint32_t magic;
+  uint16_t ver;
+  uint16_t reserved;
+  float table[CAL_STEPS];
+  uint32_t crc32;
 };
+
+// Simple CRC32 (software) for small blob
+uint32_t crc32_update(uint32_t crc, uint8_t data) {
+  crc ^= data;
+  for (int i = 0; i < 8; i++) {
+    uint32_t mask = -(crc & 1);
+    crc = (crc >> 1) ^ (0xEDB88320 & mask);
+  }
+  return crc;
+}
+uint32_t crc32_calc(const uint8_t* data, size_t len) {
+  uint32_t crc = 0xFFFFFFFF;
+  for (size_t i = 0; i < len; i++) crc = crc32_update(crc, data[i]);
+  return ~crc;
+}
 
 // ================= INTERRUPTS =================
 void IRAM_ATTR isrFlow() { flowPulses++; }
-void IRAM_ATTR isrRpm()  { rpmPulses++; }  // FALLING only
+// RPM interrupt counts ONE edge only (FALLING) so you don’t double-count by approach+leave
+void IRAM_ATTR isrRpm()  { rpmPulses++; }
 
 // ================= X9C (digital pot) =================
 void x9cPulse() {
@@ -178,6 +207,7 @@ void x9cSet(int target) {
 float max6675ReadC(uint8_t csPin) {
   digitalWrite(csPin, LOW);
   delayMicroseconds(5);
+
   uint16_t v = 0;
   for (int i = 15; i >= 0; i--) {
     digitalWrite(MAX_SCK, HIGH);
@@ -189,12 +219,12 @@ float max6675ReadC(uint8_t csPin) {
   }
   digitalWrite(csPin, HIGH);
 
-  if (v & 0x0004) return NAN;
+  if (v & 0x0004) return NAN;              // open thermocouple
   int tempCounts = (v >> 3) & 0x0FFF;
   return tempCounts * 0.25f;
 }
 
-// ================= NC ALARM RELAY =================
+// ================= NC ALARM RELAY STRATEGY =================
 void setAlarmSilenced(bool silenced) {
   digitalWrite(RELAY_ALARM, silenced ? HIGH : LOW);
   alarmRelaySilenced = silenced;
@@ -203,7 +233,13 @@ void setAlarmSilenced(bool silenced) {
 // ================= HELPERS =================
 static inline bool isNum(float x) { return !isnan(x) && isfinite(x); }
 
-// Interpolate expected flow from calibration
+bool tableAllZero(const float* t) {
+  for (int i = 0; i < CAL_STEPS; i++) {
+    if (fabsf(t[i]) > 0.0001f) return false;
+  }
+  return true;
+}
+
 float expectedFlowFromCal(int pwm) {
   if (!calibrateComplete) return NAN;
   if (pwm <= calPwmStep[0]) return calFlowLmin[0];
@@ -222,7 +258,6 @@ float expectedFlowFromCal(int pwm) {
 
 // ===== Calibration validation =====
 bool validateCalibrationTable(const float* t, String &reason) {
-  // Basic sanity
   float minV = 1e9f, maxV = -1e9f;
   int goodPts = 0;
   int badDecreases = 0;
@@ -237,25 +272,19 @@ bool validateCalibrationTable(const float* t, String &reason) {
     if (t[i] >= CAL_MIN_REAL_FLOW_LMIN) goodPts++;
   }
 
-  // All zeros / basically no flow
   if (maxV < CAL_MIN_REAL_FLOW_LMIN) {
     reason = "No real flow measured";
     return false;
   }
-
-  // Not enough points above "real flow" threshold
   if (goodPts < CAL_MIN_GOOD_POINTS) {
     reason = "Too few valid points";
     return false;
   }
-
-  // Must have some spread (pump not responding / sensor dead gives flat line)
   if ((maxV - minV) < CAL_MIN_SPREAD_LMIN) {
     reason = "Too flat (pump/sensor?)";
     return false;
   }
 
-  // Mostly increasing (allow small noise)
   for (int i = 1; i < CAL_STEPS; i++) {
     float d = t[i] - t[i-1];
     if (d < -CAL_DECREASE_TOL_LMIN) badDecreases++;
@@ -269,45 +298,68 @@ bool validateCalibrationTable(const float* t, String &reason) {
   return true;
 }
 
-// ===== NVS Calibration Handling =====
-void saveCalToNVS(const float* table) {
-  prefs.begin("ECU", false);
-  prefs.putUInt("hasCal", 1);
-  for (int i = 0; i < CAL_STEPS; i++) {
-    char key[8];
-    sprintf(key, "cal%d", calPwmStep[i]);
-    prefs.putFloat(key, table[i]);
-  }
-  prefs.end();
-}
+// ================= NVS Calibration Handling =================
+bool loadCalFromNVS(float* outTable, CalState &stateOut) {
+  stateOut = CAL_DEFAULT_RECOMMENDED;
 
-bool loadCalFromNVS(float* outTable) {
   prefs.begin("ECU", true);
-  uint32_t has = prefs.getUInt("hasCal", 0);
-  if (has != 1) {
+  size_t len = prefs.getBytesLength("calblob");
+  if (len != sizeof(CalBlob)) {
     prefs.end();
+    if (len > 0) {
+      stateOut = CAL_ERROR; // something stored but wrong size
+    } else {
+      stateOut = CAL_DEFAULT_RECOMMENDED; // nothing stored
+    }
     return false;
   }
-  for (int i = 0; i < CAL_STEPS; i++) {
-    char key[8];
-    sprintf(key, "cal%d", calPwmStep[i]);
-    outTable[i] = prefs.getFloat(key, 0.0f);
-  }
+
+  CalBlob blob;
+  prefs.getBytes("calblob", &blob, sizeof(blob));
   prefs.end();
+
+  // validate blob
+  if (blob.magic != CAL_MAGIC || blob.ver != CAL_VER) {
+    stateOut = CAL_ERROR;
+    return false;
+  }
+
+  uint32_t crc = crc32_calc((const uint8_t*)(&blob), sizeof(blob) - sizeof(blob.crc32));
+  if (crc != blob.crc32) {
+    stateOut = CAL_ERROR;
+    return false;
+  }
+
+  // copy out
+  for (int i = 0; i < CAL_STEPS; i++) outTable[i] = blob.table[i];
+
+  if (tableAllZero(outTable)) {
+    stateOut = CAL_DEFAULT_RECOMMENDED; // all zeros means "needs calibration"
+    return true; // “loaded”, but not usable
+  }
+
+  stateOut = CAL_OK;
   return true;
 }
 
-void applyDefaultCalAndSave() {
-  for (int i = 0; i < CAL_STEPS; i++) calFlowLmin[i] = DEFAULT_CAL_FLOW_LMIN[i];
-  saveCalToNVS(DEFAULT_CAL_FLOW_LMIN);
+void saveCalToNVS(const float* table) {
+  CalBlob blob;
+  blob.magic = CAL_MAGIC;
+  blob.ver = CAL_VER;
+  blob.reserved = 0;
+  for (int i = 0; i < CAL_STEPS; i++) blob.table[i] = table[i];
+  blob.crc32 = crc32_calc((const uint8_t*)(&blob), sizeof(blob) - sizeof(blob.crc32));
 
-  // If defaults are all zeros (like now), don't treat as valid for restriction logic.
-  // After tomorrow, when defaults are real, you can set this to true if you want.
-  calibrateComplete = false;
-
-  calibLastOk = true;
-  calibLastMsg = "Restored defaults";
+  prefs.begin("ECU", false);
+  prefs.putBytes("calblob", &blob, sizeof(blob));
+  prefs.end();
 }
+
+// ================= CALIBRATION PROCESS =================
+int   calStepIndex = -1;
+uint32_t calStepStart = 0;
+float  calStepAccumFlow = 0.0f;
+uint32_t calStepAccumCount = 0;
 
 // ================= WEB UI =================
 String pageHTML() {
@@ -329,9 +381,10 @@ String pageHTML() {
     .ok { color: #0a7a0a; font-weight: 800; }
     .warn { color: #b36b00; font-weight: 800; }
     .muted { opacity: 0.55; }
-    button { padding: 8px 12px; border-radius: 10px; border: 1px solid #aaa; background: #fafafa; }
-    button:disabled { opacity: 0.55; }
+    button { padding: 10px 12px; border-radius: 10px; border: 1px solid #aaa; background: #fafafa; }
+    button:disabled { opacity: 0.45; }
     input[type=range] { height: 32px; }
+    .spacer { height: 14px; }
   </style>
 </head>
 <body>
@@ -385,7 +438,7 @@ String pageHTML() {
 
     <div class="row small">
       <div>Cal Table</div>
-      <div class="mono" id="caltable">Not calibrated</div>
+      <div class="mono" id="caltable">...</div>
     </div>
   </div>
 
@@ -393,20 +446,20 @@ String pageHTML() {
     <div class="big">Manual PWM: <span id="sval">0</span></div>
     <input type="range" min="0" max="99" value="0" id="slider" style="width:100%;" oninput="setPWM(this.value)">
 
-    <div style="margin: 12px 0 16px 0;">
-      <button id="calibBtn" onclick="startCalibration()">Calibrate</button>
-    </div>
+    <div class="spacer"></div>
 
-    <div style="margin: 8px 0 16px 0;">
-      <button id="restoreBtn" onclick="restoreDefaults()">Restore Defaults</button>
-    </div>
+    <button id="calibBtn" onclick="startCalibration()">Calibrate</button>
 
-    <div style="margin: 8px 0;">
-      <button id="muteBtn" onclick="toggleMute()">Mute Alarm</button>
-      <button id="alarmToggleBtn" onclick="toggleAlarm()" style="display:none;">Toggle Alarm</button>
-    </div>
+    <div class="spacer"></div>
 
-    <div class="small" style="margin-top:8px;">IP: <code>192.168.4.1</code></div>
+    <button id="restoreBtn" onclick="restoreDefaults()">Restore Default Calibration</button>
+
+    <div class="spacer"></div>
+
+    <button id="muteBtn" onclick="toggleMute()">Mute Alarm</button>
+    <button id="alarmToggleBtn" onclick="toggleAlarm()" style="display:none;">Toggle Alarm</button>
+
+    <div class="small" style="margin-top:10px;">IP: <code>192.168.4.1</code></div>
   </div>
 
 <script>
@@ -440,34 +493,15 @@ async function refresh(){
     statusMsg.classList.add(d.statusClass || "ok");
 
     calStatus.textContent = d.calMsg || "OK";
-    calStatus.className = "mono " + (d.calOk ? "ok" : "error");
-
-    if (d.errMix) tmix.classList.add("error"); else tmix.classList.remove("error");
-    if (d.errCat) tcat.classList.add("error"); else tcat.classList.remove("error");
-
-    if (d.errFlow || d.errNoMove || d.errUnexpected) {
-      flow.classList.add("error");
-      flowh.classList.add("error");
-    } else {
-      flow.classList.remove("error");
-      flowh.classList.remove("error");
-    }
+    calStatus.className = "mono " + (d.calOk ? "ok" : "warn");
 
     modeSwitch.checked = d.autoMode ? false : true;
 
     const manual = !d.autoMode;
-
-    slider.disabled = !manual;
+    slider.disabled = !manual || d.calibrating;
     calibBtn.disabled = !manual || d.calibrating;
-    restoreBtn.disabled = d.calibrating;
-
-    if (!manual) {
-      slider.classList.add("muted");
-      calibBtn.classList.add("muted");
-    } else {
-      slider.classList.remove("muted");
-      calibBtn.classList.remove("muted");
-    }
+    restoreBtn.disabled = !manual || d.calibrating;   // ONLY manual mode
+    restoreBtn.style.display = manual ? "inline" : "none";
 
     if (manual) {
       alarmToggleBtn.style.display = "inline";
@@ -479,15 +513,14 @@ async function refresh(){
     sval.textContent  = d.pwm;
     slider.value      = d.pwm;
 
-    if (d.tableOk && Array.isArray(d.cal) && d.cal.length === 9) {
+    // cal table display
+    if (Array.isArray(d.cal) && d.cal.length === 9) {
       const steps = [20,30,40,50,60,70,80,90,100];
       let s = "";
       for (let i=0;i<steps.length;i++){
         s += steps[i] + "%=" + Number(d.cal[i]).toFixed(1) + " ";
       }
       caltable.textContent = s.trim();
-    } else {
-      caltable.textContent = "Not calibrated";
     }
 
     muteBtn.disabled = !d.alarm;
@@ -515,7 +548,7 @@ async function startCalibration(){
 }
 
 async function restoreDefaults(){
-  if (!confirm("Restore default calibration table from firmware?\nThis overwrites saved calibration.")) return;
+  if (!confirm("Restore DEFAULT calibration table?\nThis overwrites saved calibration.")) return;
   if (!confirm("Are you REALLY sure?")) return;
   await fetch('/restore');
 }
@@ -544,17 +577,17 @@ void handleRoot() {
   server.send(200, "text/html; charset=utf-8", pageHTML());
 }
 
+// ================= CAL runtime flags =================
+bool calWarningLevel1 = false; // missing/all-zero/default/error => level 1 alarm until resolved
+
 void handleData() {
   server.sendHeader("Cache-Control", "no-store");
   server.sendHeader("Pragma", "no-cache");
 
-  float flm = flow_Lmin;
-  float flh = flow_Lh;
-  float rv  = rpmValue;
-
   float fHz = flowHz_x100 / 100.0f;
   float rHz = rpmHz_x100  / 100.0f;
 
+  // status string
   String status = "OK";
   String statusClass = "ok";
 
@@ -579,19 +612,38 @@ void handleData() {
     if (flowRestrictFault) msg += "Flow LOW; ";
     if (flowUnexpectedFault) msg += "Unexpected FLOW; ";
 
+    if (calWarningLevel1) msg += "Calibration needs attention; ";
+
     if (msg.endsWith("; ")) msg.remove(msg.length() - 2);
     status = (alarmLevel >= 3 ? "CRITICAL: " : "WARNING: ") + msg;
+  } else if (calWarningLevel1) {
+    status = "WARNING: Calibration needs attention";
+    statusClass = "warn";
+  }
+
+  // calibration message
+  String calMsg;
+  bool calOk = true;
+  if (calState == CAL_OK) {
+    calMsg = "OK";
+    calOk = true;
+  } else if (calState == CAL_DEFAULT_RECOMMENDED) {
+    calMsg = "Default calibration in use – calibration is recommended";
+    calOk = false;
+  } else {
+    calMsg = "Calibration error – please recalibrate or restore defaults";
+    calOk = false;
   }
 
   String json = "{";
   json += "\"fuel\":" + String(fuelActive ? "true" : "false") + ",";
 
-  json += "\"rpm\":"    + String((int)(rv + 0.5f)) + ",";
+  json += "\"rpm\":"    + String((int)(rpmValue + 0.5f)) + ",";
   json += "\"rpmHz\":"  + String(rHz, 2) + ",";
   json += "\"rpmDp\":"  + String((uint32_t)rpmDpLast) + ",";
 
-  json += "\"flowLmin\":" + String(flm, 3) + ",";
-  json += "\"flowLh\":"   + String(flh, 1) + ",";
+  json += "\"flowLmin\":" + String(flow_Lmin, 3) + ",";
+  json += "\"flowLh\":"   + String(flow_Lh, 1) + ",";
   json += "\"flowHz\":"   + String(fHz, 2) + ",";
   json += "\"flowDp\":"   + String((uint32_t)flowDpLast) + ",";
 
@@ -607,14 +659,6 @@ void handleData() {
   json += "\"autoMode\":" + String(autoMode ? "true" : "false") + ",";
   json += "\"calibrating\":" + String(calibrating ? "true" : "false") + ",";
 
-  bool errMix = (!isNum(tMix) || (isNum(tMix) && tMix >= MIX_WARN_C));
-  bool errCat = (!isNum(tCat) || (isNum(tCat) && tCat >= CAT_HIGH_C));
-  json += "\"errMix\":" + String(errMix ? "true" : "false") + ",";
-  json += "\"errCat\":" + String(errCat ? "true" : "false") + ",";
-  json += "\"errFlow\":" + String(flowRestrictFault ? "true" : "false") + ",";
-  json += "\"errNoMove\":" + String(flowNoMoveFault ? "true" : "false") + ",";
-  json += "\"errUnexpected\":" + String(flowUnexpectedFault ? "true" : "false") + ",";
-
   json += "\"tableOk\":" + String(calibrateComplete ? "true" : "false") + ",";
   json += "\"cal\":[";
   for (int i = 0; i < CAL_STEPS; i++) {
@@ -623,8 +667,8 @@ void handleData() {
   }
   json += "],";
 
-  json += "\"calOk\":" + String(calibLastOk ? "true" : "false") + ",";
-  json += "\"calMsg\":\"" + calibLastMsg + "\",";
+  json += "\"calOk\":" + String(calOk ? "true" : "false") + ",";
+  json += "\"calMsg\":\"" + calMsg + "\",";
 
   json += "\"status\":\"" + status + "\",";
   json += "\"statusClass\":\"" + statusClass + "\"";
@@ -674,6 +718,7 @@ void handleSet() {
   server.send(200, "text/plain; charset=utf-8", "OK");
 }
 
+// ================= CALIBRATE / RESTORE HANDLERS =================
 void handleCalibrate() {
   if (autoMode) {
     server.send(400, "text/plain; charset=utf-8", "ERROR: switch to manual mode");
@@ -684,7 +729,7 @@ void handleCalibrate() {
     return;
   }
 
-  // snapshot current known-good calibration into RAM
+  // snapshot current calibration in RAM
   for (int i = 0; i < CAL_STEPS; i++) calFlowLmin_lastGood[i] = calFlowLmin[i];
   hasLastGoodInRam = true;
 
@@ -696,25 +741,40 @@ void handleCalibrate() {
 
   calibLastOk = true;
   calibLastMsg = "Calibrating...";
-
   setAlarmSilenced(true);
 
   server.send(200, "text/plain; charset=utf-8", "CALIBRATION_STARTED");
 }
 
 void handleRestore() {
+  // Only manual mode
+  if (autoMode) {
+    server.send(400, "text/plain; charset=utf-8", "ERROR: switch to manual mode");
+    return;
+  }
   if (calibrating) {
     server.send(400, "text/plain; charset=utf-8", "ERROR: calibrating");
     return;
   }
-  applyDefaultCalAndSave();
 
+  // Write defaults to NVS ON PURPOSE
+  saveCalToNVS(DEFAULT_CAL_FLOW_LMIN);
+
+  // Load defaults into RAM
+  for (int i = 0; i < CAL_STEPS; i++) calFlowLmin[i] = DEFAULT_CAL_FLOW_LMIN[i];
+
+  // After restore: treat as “default in use” (recommended) unless you want to mark it as OK.
+  // Your request: default should not be zero and shouldn’t be treated as an error.
+  // We'll mark it as OK because it's valid non-zero calibration data now.
+  calibrateComplete = true;
+  calState = CAL_OK;
+  calWarningLevel1 = false;
+
+  // Clear faults that depend on calibration
   flowRestrictFault = false;
   flowNoMoveFault = false;
   flowUnexpectedFault = false;
-  flowRestrictSince = 0;
-  flowLowSince = 0;
-  flowUnexpectedSince = 0;
+  flowRestrictSince = flowLowSince = flowUnexpectedSince = 0;
 
   server.send(200, "text/plain; charset=utf-8", "RESTORED_DEFAULTS");
 }
@@ -824,7 +884,7 @@ void updateCalibration() {
     return;
   }
 
-  // done: stop pump first
+  // done: stop pump
   pwmCmd = 0;
   x9cSet(0);
 
@@ -833,96 +893,46 @@ void updateCalibration() {
   bool ok = validateCalibrationTable(calFlowLmin, why);
 
   if (ok) {
-    calibrateComplete = true;
     saveCalToNVS(calFlowLmin);
+
+    calibrateComplete = true;
+    calState = CAL_OK;
+    calWarningLevel1 = false;
+
     calibLastOk = true;
     calibLastMsg = "Calibration OK (saved)";
-    // refresh lastGood snapshot
+
     for (int i = 0; i < CAL_STEPS; i++) calFlowLmin_lastGood[i] = calFlowLmin[i];
     hasLastGoodInRam = true;
   } else {
-    // revert to last good table in RAM (if we have it)
+    // revert to last good table in RAM
     if (hasLastGoodInRam) {
       for (int i = 0; i < CAL_STEPS; i++) calFlowLmin[i] = calFlowLmin_lastGood[i];
     }
+
+    // Keep calState as-is, but show warning
+    calWarningLevel1 = true;
+
     calibLastOk = false;
     calibLastMsg = "Calibration FAILED (" + why + ") kept old";
-    // keep calibrateComplete as-is (do NOT force true)
   }
 
   calibrating = false;
 }
 
-void updateTempsAndAlarm() {
+void updateTemps() {
   static uint32_t last = 0;
   if (millis() - last < 300) return;
   last = millis();
 
   tCat = max6675ReadC(MAX_CS_CAT);
   tMix = max6675ReadC(MAX_CS_MIX);
-
-  int newLevel = 0;
-  bool any = false;
-
-  if (!isNum(tMix) || !isNum(tCat)) { newLevel = 3; any = true; }
-
-  if (isNum(tMix)) {
-    if (tMix >= MIX_CRIT_C) { newLevel = max(newLevel, 3); any = true; }
-    else if (tMix >= MIX_HIGH_C) { newLevel = max(newLevel, 2); any = true; }
-    else if (tMix >= MIX_WARN_C) { newLevel = max(newLevel, 1); any = true; }
-  }
-
-  if (isNum(tCat)) {
-    if (tCat >= CAT_CRIT_C) { newLevel = max(newLevel, 3); any = true; }
-    else if (tCat >= CAT_HIGH_C) { newLevel = max(newLevel, 2); any = true; }
-  }
-
-  if (flowNoMoveFault) { newLevel = max(newLevel, 3); any = true; }
-  if (flowUnexpectedFault) { newLevel = max(newLevel, 2); any = true; }
-  if (flowRestrictFault) { newLevel = max(newLevel, 1); any = true; }
-
-  alarmActive = any;
-  alarmLevel = newLevel;
-
-  if (!autoMode) return;
-
-  if (alarmMuted && millis() > alarmMutedUntil) {
-    alarmMuted = false;
-    alarmMutedUntil = 0;
-  }
-
-  if (!alarmActive) {
-    setAlarmSilenced(true);
-    return;
-  }
-
-  bool shouldSound = false;
-  static uint32_t levelStartTime = 0;
-  static int prevLevel = -1;
-  if (alarmLevel != prevLevel) {
-    prevLevel = alarmLevel;
-    levelStartTime = millis();
-  }
-
-  if (alarmLevel >= 3) {
-    shouldSound = true;
-  } else {
-    uint32_t elapsed = millis() - levelStartTime;
-    uint32_t cycle = elapsed % 30000UL;
-    if (alarmLevel == 2) shouldSound = (cycle < 3000UL);
-    if (alarmLevel == 1) shouldSound = (cycle < 1000UL);
-  }
-
-  if (alarmMuted) shouldSound = false;
-
-  setAlarmSilenced(!shouldSound);
 }
 
 void updatePumpControlAndFlowChecks() {
   if (!autoMode || calibrating) return;
 
   int targetPwm = 0;
-
   bool engineRunning = (fuelActive && rpmValue > ENGINE_RPM_MIN);
 
   if (engineRunning) {
@@ -932,8 +942,7 @@ void updatePumpControlAndFlowChecks() {
 
     float fraction = (rpmClamped - ENGINE_RPM_MIN) / float(PUMP_RPM_MAX - ENGINE_RPM_MIN);
     float basePwmF = PUMP_PWM_MIN + fraction * float(PUMP_PWM_MAX - PUMP_PWM_MIN);
-    if (basePwmF > PUMP_PWM_MAX) basePwmF = PUMP_PWM_MAX;
-    if (basePwmF < 0) basePwmF = 0;
+    basePwmF = constrain(basePwmF, 0.0f, 99.0f);
     targetPwm = int(basePwmF + 0.5f);
 
     if (!boostActive && isNum(tMix) && tMix >= MIX_HIGH_C) boostActive = true;
@@ -949,7 +958,7 @@ void updatePumpControlAndFlowChecks() {
   uint32_t now = millis();
   bool pumpShouldBeOn = (targetPwm >= PUMP_PWM_MIN);
 
-  // NO FLOW
+  // NO FLOW (pump ON but flow below threshold for long enough)
   if (pumpShouldBeOn) {
     if (pumpNonZeroSince == 0) pumpNonZeroSince = now;
 
@@ -968,9 +977,8 @@ void updatePumpControlAndFlowChecks() {
     flowNoMoveFault = false;
   }
 
-  // Unexpected flow
-  bool shouldHaveFlow = pumpShouldBeOn;
-  if (!shouldHaveFlow) {
+  // Unexpected flow (flow when pump should be OFF)
+  if (!pumpShouldBeOn) {
     if (flow_Lmin > FLOW_UNEXPECTED_LMIN) {
       if (flowUnexpectedSince == 0) flowUnexpectedSince = now;
       if (now - flowUnexpectedSince >= FLOW_UNEXPECTED_HOLD_MS) flowUnexpectedFault = true;
@@ -983,7 +991,7 @@ void updatePumpControlAndFlowChecks() {
     flowUnexpectedFault = false;
   }
 
-  // Restriction (only when we have a valid table)
+  // Restriction (only if calibration complete)
   if (calibrateComplete && pumpShouldBeOn && !flowNoMoveFault) {
     float expF = expectedFlowFromCal(targetPwm);
     if (isNum(expF) && expF > 0.1f) {
@@ -1007,9 +1015,71 @@ void updatePumpControlAndFlowChecks() {
   x9cSet(pwmCmd);
 }
 
+void updateAlarmLogic() {
+  // Calibration attention forces Level 1 if nothing else is worse
+  int newLevel = 0;
+  bool any = false;
+
+  // sensor faults => critical
+  if (!isNum(tMix) || !isNum(tCat)) { newLevel = 3; any = true; }
+
+  if (isNum(tMix)) {
+    if (tMix >= MIX_CRIT_C) { newLevel = max(newLevel, 3); any = true; }
+    else if (tMix >= MIX_HIGH_C) { newLevel = max(newLevel, 2); any = true; }
+    else if (tMix >= MIX_WARN_C) { newLevel = max(newLevel, 1); any = true; }
+  }
+
+  if (isNum(tCat)) {
+    if (tCat >= CAT_CRIT_C) { newLevel = max(newLevel, 3); any = true; }
+    else if (tCat >= CAT_HIGH_C) { newLevel = max(newLevel, 2); any = true; }
+  }
+
+  if (flowNoMoveFault)        { newLevel = max(newLevel, 3); any = true; }
+  if (flowUnexpectedFault)    { newLevel = max(newLevel, 2); any = true; }
+  if (flowRestrictFault)      { newLevel = max(newLevel, 1); any = true; }
+
+  if (calWarningLevel1)       { newLevel = max(newLevel, 1); any = true; }
+
+  alarmActive = any;
+  alarmLevel = newLevel;
+
+  if (!autoMode) return;
+
+  if (alarmMuted && millis() > alarmMutedUntil) {
+    alarmMuted = false;
+    alarmMutedUntil = 0;
+  }
+
+  if (!alarmActive) {
+    setAlarmSilenced(true);
+    return;
+  }
+
+  bool shouldSound = false;
+  static uint32_t levelStartTime = 0;
+  static int prevLevel = -1;
+
+  if (alarmLevel != prevLevel) {
+    prevLevel = alarmLevel;
+    levelStartTime = millis();
+  }
+
+  if (alarmLevel >= 3) {
+    shouldSound = true; // continuous
+  } else {
+    uint32_t elapsed = millis() - levelStartTime;
+    uint32_t cycle = elapsed % 30000UL;
+    if (alarmLevel == 2) shouldSound = (cycle < 3000UL);
+    if (alarmLevel == 1) shouldSound = (cycle < 1000UL);
+  }
+
+  if (alarmMuted) shouldSound = false;
+  setAlarmSilenced(!shouldSound);
+}
+
 // ================= SETUP / LOOP =================
 void setup() {
-  // X9C
+  // ---- X9C init ----
   pinMode(X9C_CS, OUTPUT);
   pinMode(X9C_UD, OUTPUT);
   pinMode(X9C_INC, OUTPUT);
@@ -1021,7 +1091,7 @@ void setup() {
   pwmCmd = 0;
   x9cSet(0);
 
-  // MAX6675
+  // ---- MAX6675 init ----
   pinMode(MAX_SCK, OUTPUT);
   pinMode(MAX_SO, INPUT);
   pinMode(MAX_CS_CAT, OUTPUT);
@@ -1030,43 +1100,59 @@ void setup() {
   digitalWrite(MAX_CS_CAT, HIGH);
   digitalWrite(MAX_CS_MIX, HIGH);
 
-  // Alarm relay
+  // ---- Alarm relay init ----
   pinMode(RELAY_ALARM, OUTPUT);
   setAlarmSilenced(false);
   delay(600);
   setAlarmSilenced(true);
 
-  // Fuel
+  // ---- Fuel sense ----
   pinMode(FUEL_SENSE, INPUT_PULLUP);
 
-  // Flow
+  // ---- Flow input ----
   pinMode(FLOW_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(FLOW_PIN), isrFlow, FALLING);
 
-  // RPM (fix: only one edge)
+  // ---- RPM Hall input ----
   pinMode(RPM_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(RPM_PIN), isrRpm, FALLING);
 
-  // Load calibration (or seed defaults)
+  // ---- Load calibration (READ ONLY at startup - NO WRITES) ----
   float tmp[CAL_STEPS];
-  bool hasNvs = loadCalFromNVS(tmp);
+  CalState st;
+  bool loaded = loadCalFromNVS(tmp, st);
 
-  if (!hasNvs) {
-    applyDefaultCalAndSave(); // seeds defaults to NVS
+  if (!loaded) {
+    // No valid stored calibration -> use defaults in RAM only
+    for (int i = 0; i < CAL_STEPS; i++) calFlowLmin[i] = DEFAULT_CAL_FLOW_LMIN[i];
+
+    calState = st; // DEFAULT_RECOMMENDED or ERROR
+    calibrateComplete = (st == CAL_OK); // false
+    calWarningLevel1 = true;
   } else {
-    for (int i = 0; i < CAL_STEPS; i++) calFlowLmin[i] = tmp[i];
-    calibrateComplete = true;
-
-    // set lastGood snapshot
-    for (int i = 0; i < CAL_STEPS; i++) calFlowLmin_lastGood[i] = calFlowLmin[i];
-    hasLastGoodInRam = true;
+    // We loaded something. It might still be “all zero” table.
+    if (tableAllZero(tmp)) {
+      for (int i = 0; i < CAL_STEPS; i++) calFlowLmin[i] = DEFAULT_CAL_FLOW_LMIN[i];
+      calState = CAL_DEFAULT_RECOMMENDED;
+      calibrateComplete = false; // not usable for restriction logic
+      calWarningLevel1 = true;   // beep 1s/30s
+    } else {
+      for (int i = 0; i < CAL_STEPS; i++) calFlowLmin[i] = tmp[i];
+      calState = CAL_OK;
+      calibrateComplete = true;
+      calWarningLevel1 = false;
+    }
   }
 
-  // Start AP
+  // snapshot lastGood in RAM (so bad calibration won't wipe it)
+  for (int i = 0; i < CAL_STEPS; i++) calFlowLmin_lastGood[i] = calFlowLmin[i];
+  hasLastGoodInRam = true;
+
+  // ---- Start AP ----
   WiFi.mode(WIFI_AP);
   WiFi.softAP(ap_ssid, ap_pass);
 
-  // Web routes
+  // ---- Web routes ----
   server.on("/", handleRoot);
   server.on("/data", handleData);
   server.on("/set", handleSet);
@@ -1081,10 +1167,12 @@ void loop() {
   updateFuelSense();
   updateFlow();
   updateRPM();
+  updateTemps();
+
   updateCalibration();
 
   if (!calibrating) {
     updatePumpControlAndFlowChecks();
-    updateTempsAndAlarm();
+    updateAlarmLogic();
   }
 }
