@@ -146,6 +146,7 @@ uint32_t calibFailSerial = 0;
 // Calibration status classification:
 enum CalState { CAL_OK, CAL_DEFAULT_RECOMMENDED, CAL_ERROR };
 CalState calState = CAL_DEFAULT_RECOMMENDED;
+bool calUsingDefault = false;
 
 // ============ NVS layout (robust: magic + version + crc) ============
 static const uint32_t CAL_MAGIC = 0xEC0CA1B0;
@@ -239,6 +240,14 @@ static inline bool isNum(float x) { return !isnan(x) && isfinite(x); }
 bool tableAllZero(const float* t) {
   for (int i = 0; i < CAL_STEPS; i++) {
     if (fabsf(t[i]) > 0.0001f) return false;
+  }
+  return true;
+}
+
+bool tableMatchesDefault(const float* t) {
+  const float EPS = 0.01f;
+  for (int i = 0; i < CAL_STEPS; i++) {
+    if (fabsf(t[i] - DEFAULT_CAL_FLOW_LMIN[i]) > EPS) return false;
   }
   return true;
 }
@@ -384,6 +393,9 @@ String pageHTML() {
     .ok { color: #0a7a0a; font-weight: 800; }
     .warn { color: #b36b00; font-weight: 800; }
     .muted { opacity: 0.55; }
+    .value { font-weight: 700; }
+    .mode-btn { padding: 8px 14px; border-radius: 18px; border: 1px solid #aaa; background: #f5f5f5; min-width: 96px; }
+    .mode-btn.manual { background: #0b6cff; color: white; border-color: #0b6cff; }
     button { padding: 10px 12px; border-radius: 10px; border: 1px solid #aaa; background: #fafafa; }
     button:disabled { opacity: 0.45; }
     input[type=range] { height: 32px; }
@@ -400,11 +412,7 @@ String pageHTML() {
     </div>
     <div class="row small">
       <div>Mode</div>
-      <div>
-        <label>
-          Auto <input type="checkbox" id="modeSwitch"> Manual
-        </label>
-      </div>
+      <div><button id="modeBtn" class="mode-btn" onclick="toggleMode()">Auto</button></div>
     </div>
     <div class="row small">
       <div>Calibration</div>
@@ -413,12 +421,12 @@ String pageHTML() {
   </div>
 
   <div class="card">
-    <div class="row big"><div>Fuel</div><div id="fuel">?</div></div>
+    <div class="row big"><div>Fuel</div><div class="mono value" id="fuel">?</div></div>
 
     <div class="row big">
       <div>RPM</div>
       <div class="mono">
-        <span id="rpm">?</span>
+        <span class="value" id="rpm">?</span>
         <span class="small">(<span id="rpmhz">?</span> Hz, dp=<span id="rpmdp">?</span>)</span>
       </div>
     </div>
@@ -426,21 +434,23 @@ String pageHTML() {
     <div class="row big">
       <div>Flow</div>
       <div class="mono">
-        <span id="flow">?</span> L/min (<span id="flowh">?</span> L/h)
+        <span class="value" id="flow">?</span> L/min (<span class="value" id="flowh">?</span> L/h)
         <span class="small">- <span id="flowhz">?</span> Hz, dp=<span id="flowdp">?</span></span>
       </div>
     </div>
 
-    <div class="row big"><div>Tcat</div><div class="mono"><span id="tcat">?</span> &deg;C</div></div>
-    <div class="row big"><div>Tmix</div><div class="mono"><span id="tmix">?</span> &deg;C</div></div>
+    <div class="row big"><div>Tcat</div><div class="mono"><span class="value" id="tcat">?</span> &deg;C</div></div>
+    <div class="row big"><div>Tmix</div><div class="mono"><span class="value" id="tmix">?</span> &deg;C</div></div>
 
     <div class="row big"><div>PWM (cmd)</div><div class="mono" id="pwm">?</div></div>
     <div class="row big"><div>X9C (pos)</div><div class="mono" id="x9c">?</div></div>
 
-    <div class="row big"><div>Alarm</div><div class="mono" id="alarm">?</div></div>
+    <div class="row big"><div>Alarm</div><div class="mono value" id="alarm">?</div></div>
+  </div>
 
+  <div class="card">
     <div class="row small">
-      <div>Cal Table</div>
+      <div>Calibration Table</div>
       <div class="mono" id="caltable">...</div>
     </div>
   </div>
@@ -466,6 +476,13 @@ String pageHTML() {
   </div>
 
 <script>
+function applyLevel(el, level){
+  if (!el) return;
+  el.classList.remove("warn", "error");
+  if (level >= 2) el.classList.add("error");
+  else if (level === 1) el.classList.add("warn");
+}
+
 async function refresh(){
   try{
     const r = await fetch('/data', {cache: "no-store"});
@@ -491,6 +508,12 @@ async function refresh(){
     x9c.textContent   = d.x9c;
     alarm.textContent = d.alarm ? "ON" : "off";
 
+    applyLevel(tmix, Number(d.tMixLevel || 0));
+    applyLevel(tcat, Number(d.tCatLevel || 0));
+    applyLevel(flow, Number(d.flowLevel || 0));
+    applyLevel(flowh, Number(d.flowLevel || 0));
+    applyLevel(alarm, d.alarm ? 2 : 0);
+
     statusMsg.textContent = d.status || "OK";
     statusMsg.className = "";
     statusMsg.classList.add(d.statusClass || "ok");
@@ -499,7 +522,8 @@ async function refresh(){
     const calClass = d.calFail ? "error" : (d.calOk ? "ok" : "warn");
     calStatus.className = "mono " + calClass;
 
-    modeSwitch.checked = d.autoMode ? false : true;
+    modeBtn.textContent = d.autoMode ? "Auto" : "Manual";
+    modeBtn.classList.toggle("manual", !d.autoMode);
 
     const manual = !d.autoMode;
     slider.disabled = !manual || d.calibrating;
@@ -545,10 +569,10 @@ async function setPWM(v){
   await fetch('/set?pwm=' + v);
 }
 
-modeSwitch.addEventListener('change', async function() {
-  if (this.checked) await fetch('/set?mode=manual');
-  else              await fetch('/set?mode=auto');
-});
+async function toggleMode(){
+  const wantManual = modeBtn.textContent.toLowerCase() === "auto";
+  await fetch('/set?mode=' + (wantManual ? 'manual' : 'auto'));
+}
 
 async function startCalibration(){
   if (!confirm("Start calibration?\nMake sure discharge hose is in a bucket.")) return;
@@ -587,7 +611,7 @@ void handleRoot() {
 }
 
 // ================= CAL runtime flags =================
-bool calWarningLevel1 = false; // missing/all-zero/default/error => level 1 alarm until resolved
+bool calWarningLevel1 = false; // set for calibration errors/failures that need attention
 
 void handleData() {
   server.sendHeader("Cache-Control", "no-store");
@@ -632,26 +656,49 @@ void handleData() {
     statusClass = "warn";
   }
 
+  int tMixLevel = 0;
+  if (!isNum(tMix)) tMixLevel = 3;
+  else if (tMix >= MIX_CRIT_C) tMixLevel = 3;
+  else if (tMix >= MIX_HIGH_C) tMixLevel = 2;
+  else if (tMix >= MIX_WARN_C) tMixLevel = 1;
+
+  int tCatLevel = 0;
+  if (!isNum(tCat)) tCatLevel = 3;
+  else if (tCat >= CAT_CRIT_C) tCatLevel = 3;
+  else if (tCat >= CAT_HIGH_C) tCatLevel = 2;
+
+  int flowLevel = 0;
+  String flowFaultType = "";
+  if (flowNoMoveFault)        { flowLevel = 3; flowFaultType = "no_flow"; }
+  else if (flowUnexpectedFault) { flowLevel = 2; flowFaultType = "unexpected"; }
+  else if (flowRestrictFault) { flowLevel = 1; flowFaultType = "restricted"; }
+
   // calibration message
   String calMsg;
   String calFailMsg;
-  bool calOk = true;
+  bool calOk = false;
   bool calError = false;
   if (calibFailLatched) {
     calFailMsg = calibLastMsg;
-    calMsg = "Default calibration in use – calibration is recommended";
-    calOk = false;
+    calMsg = calibLastMsg;
     calError = true;
-  } else if (calState == CAL_OK) {
-    calMsg = "OK";
-    calOk = true;
-  } else if (calState == CAL_DEFAULT_RECOMMENDED) {
-    calMsg = "Default calibration in use – calibration is recommended";
-    calOk = false;
-  } else {
+  } else if (calState == CAL_ERROR) {
     calMsg = "Calibration error – please recalibrate or restore defaults";
     calOk = false;
+    calError = true;
+  } else if (calState == CAL_DEFAULT_RECOMMENDED) {
+    if (calUsingDefault) {
+      calMsg = "OK (default)";
+      calOk = true;
+    } else {
+      calMsg = "Calibration recommended";
+      calOk = false;
+    }
+  } else {
+    calMsg = calUsingDefault ? "OK (default)" : "OK";
+    calOk = true;
   }
+  bool calFail = calError || calibFailLatched;
 
   String json = "{";
   json += "\"fuel\":" + String(fuelActive ? "true" : "false") + ",";
@@ -676,6 +723,7 @@ void handleData() {
   json += "\"alarmRelaySilenced\":" + String(alarmRelaySilenced ? "true" : "false") + ",";
   json += "\"autoMode\":" + String(autoMode ? "true" : "false") + ",";
   json += "\"calibrating\":" + String(calibrating ? "true" : "false") + ",";
+  json += "\"alarmLevel\":" + String(alarmLevel) + ",";
 
   json += "\"tableOk\":" + String(calibrateComplete ? "true" : "false") + ",";
   json += "\"cal\":[";
@@ -687,11 +735,16 @@ void handleData() {
 
   json += "\"calOk\":" + String(calOk ? "true" : "false") + ",";
   json += "\"calMsg\":\"" + calMsg + "\",";
-  json += "\"calFail\":" + String(calibFailLatched ? "true" : "false") + ",";
+  json += "\"calFail\":" + String(calFail ? "true" : "false") + ",";
   json += "\"calFailMsg\":\"" + (calFailMsg.length() ? calFailMsg : calMsg) + "\",";
   json += "\"calFailNotice\":" + String(calFailNotice ? "true" : "false") + ",";
   json += "\"calFailSerial\":" + String(calibFailSerial) + ",";
   json += "\"calError\":" + String(calError ? "true" : "false") + ",";
+  json += "\"calDefault\":" + String(calUsingDefault ? "true" : "false") + ",";
+  json += "\"tMixLevel\":" + String(tMixLevel) + ",";
+  json += "\"tCatLevel\":" + String(tCatLevel) + ",";
+  json += "\"flowLevel\":" + String(flowLevel) + ",";
+  json += "\"flowFaultType\":\"" + flowFaultType + "\",";
 
   json += "\"status\":\"" + status + "\",";
   json += "\"statusClass\":\"" + statusClass + "\"";
@@ -793,6 +846,7 @@ void handleRestore() {
   // We'll mark it as OK because it's valid non-zero calibration data now.
   calibrateComplete = true;
   calState = CAL_OK;
+  calUsingDefault = true;
   calWarningLevel1 = false;
 
   // Clear faults that depend on calibration
@@ -922,6 +976,7 @@ void updateCalibration() {
 
     calibrateComplete = true;
     calState = CAL_OK;
+    calUsingDefault = tableMatchesDefault(calFlowLmin);
     calWarningLevel1 = false;
 
     calibLastOk = true;
@@ -939,6 +994,7 @@ void updateCalibration() {
 
     calibrateComplete = true;
     calState = CAL_DEFAULT_RECOMMENDED;
+    calUsingDefault = true;
     calWarningLevel1 = true;
 
     calibLastOk = false;
@@ -1157,22 +1213,35 @@ void setup() {
     // No valid stored calibration -> use defaults in RAM only
     for (int i = 0; i < CAL_STEPS; i++) calFlowLmin[i] = DEFAULT_CAL_FLOW_LMIN[i];
 
-    calState = st; // DEFAULT_RECOMMENDED or ERROR
-    calibrateComplete = (st == CAL_OK); // false
-    calWarningLevel1 = true;
-  } else {
-    // We loaded something. It might still be “all zero” table.
-    if (tableAllZero(tmp)) {
-      for (int i = 0; i < CAL_STEPS; i++) calFlowLmin[i] = DEFAULT_CAL_FLOW_LMIN[i];
-      calState = CAL_DEFAULT_RECOMMENDED;
-      calibrateComplete = false; // not usable for restriction logic
-      calWarningLevel1 = true;   // beep 1s/30s
+    calUsingDefault = true;
+    if (st == CAL_ERROR) {
+      calState = CAL_ERROR;
+      calibrateComplete = false;
+      calWarningLevel1 = true;
     } else {
-      for (int i = 0; i < CAL_STEPS; i++) calFlowLmin[i] = tmp[i];
       calState = CAL_OK;
       calibrateComplete = true;
       calWarningLevel1 = false;
     }
+  } else {
+    // We loaded something. It might still be “all zero” table.
+    if (tableAllZero(tmp)) {
+      for (int i = 0; i < CAL_STEPS; i++) calFlowLmin[i] = DEFAULT_CAL_FLOW_LMIN[i];
+      calUsingDefault = true;
+      calState = CAL_DEFAULT_RECOMMENDED;
+      calibrateComplete = true;
+      calWarningLevel1 = true;   // beep 1s/30s
+    } else {
+      for (int i = 0; i < CAL_STEPS; i++) calFlowLmin[i] = tmp[i];
+      calUsingDefault = tableMatchesDefault(calFlowLmin);
+      calState = CAL_OK;
+      calibrateComplete = true;
+      calWarningLevel1 = false;
+    }
+  }
+
+  if (calUsingDefault && calState != CAL_ERROR && !calibFailLatched) {
+    calWarningLevel1 = false;
   }
 
   // snapshot lastGood in RAM (so bad calibration won't wipe it)
