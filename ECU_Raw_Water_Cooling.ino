@@ -396,10 +396,6 @@ String pageHTML() {
     .value { font-weight: 700; }
     .mode-btn { padding: 8px 14px; border-radius: 18px; border: 1px solid #aaa; background: #f5f5f5; min-width: 96px; }
     .mode-btn.manual { background: #0b6cff; color: white; border-color: #0b6cff; }
-<<<<<<< ours
-=======
-    .mode-label { font-size: 0.9em; opacity: 0.7; }
->>>>>>> theirs
     button { padding: 10px 12px; border-radius: 10px; border: 1px solid #aaa; background: #fafafa; }
     button:disabled { opacity: 0.45; }
     input[type=range] { height: 32px; }
@@ -411,24 +407,16 @@ String pageHTML() {
 
   <div class="card">
     <div class="row big">
-      <div>Status <span id="modeLabel" class="mode-label"></span></div>
+      <div>Status</div>
       <div id="statusMsg" class="ok">OK</div>
     </div>
     <div class="row small">
       <div>Mode</div>
-<<<<<<< ours
       <div><button id="modeBtn" class="mode-btn" onclick="toggleMode()">Auto</button></div>
-=======
-      <div><button id="modeBtn" class="mode-btn" onclick="toggleMode()">Change mode</button></div>
->>>>>>> theirs
     </div>
     <div class="row small">
       <div>Calibration</div>
       <div id="calStatus" class="mono">OK</div>
-    </div>
-    <div class="row small">
-      <div>Alarm Relay</div>
-      <div class="mono value" id="relayState">?</div>
     </div>
   </div>
 
@@ -488,12 +476,6 @@ String pageHTML() {
   </div>
 
 <script>
-<<<<<<< ours
-=======
-let currentAutoMode = true;
-let sliderDragging = false;
-
->>>>>>> theirs
 function applyLevel(el, level){
   if (!el) return;
   el.classList.remove("warn", "error");
@@ -525,13 +507,6 @@ async function refresh(){
     pwm.textContent   = d.pwm;
     x9c.textContent   = d.x9c;
     alarm.textContent = d.alarm ? "ON" : "off";
-    relayState.textContent = d.alarmRelaySilenced ? "Open (silenced)" : "Closed (alarming)";
-
-    applyLevel(tmix, Number(d.tMixLevel || 0));
-    applyLevel(tcat, Number(d.tCatLevel || 0));
-    applyLevel(flow, Number(d.flowLevel || 0));
-    applyLevel(flowh, Number(d.flowLevel || 0));
-    applyLevel(alarm, d.alarm ? 2 : 0);
 
     applyLevel(tmix, Number(d.tMixLevel || 0));
     applyLevel(tcat, Number(d.tCatLevel || 0));
@@ -542,19 +517,13 @@ async function refresh(){
     statusMsg.textContent = d.status || "OK";
     statusMsg.className = "";
     statusMsg.classList.add(d.statusClass || "ok");
-    modeLabel.textContent = d.autoMode ? "Auto mode" : "Manual mode";
 
     calStatus.textContent = d.calMsg || "OK";
     const calClass = d.calFail ? "error" : (d.calOk ? "ok" : "warn");
     calStatus.className = "mono " + calClass;
 
-<<<<<<< ours
     modeBtn.textContent = d.autoMode ? "Auto" : "Manual";
     modeBtn.classList.toggle("manual", !d.autoMode);
-=======
-    modeBtn.classList.toggle("manual", !d.autoMode);
-    currentAutoMode = d.autoMode;
->>>>>>> theirs
 
     const manual = !d.autoMode;
     slider.disabled = !manual || d.calibrating;
@@ -569,10 +538,8 @@ async function refresh(){
       alarmToggleBtn.style.display = "none";
     }
 
-    if (!sliderDragging) {
-      sval.textContent  = d.pwm;
-      slider.value      = d.pwm;
-    }
+    sval.textContent  = d.pwm;
+    slider.value      = d.pwm;
 
     // cal table display
     if (Array.isArray(d.cal) && d.cal.length === 9) {
@@ -603,11 +570,7 @@ async function setPWM(v){
 }
 
 async function toggleMode(){
-<<<<<<< ours
   const wantManual = modeBtn.textContent.toLowerCase() === "auto";
-=======
-  const wantManual = currentAutoMode;
->>>>>>> theirs
   await fetch('/set?mode=' + (wantManual ? 'manual' : 'auto'));
 }
 
@@ -635,11 +598,6 @@ async function toggleAlarm(){
 
 setInterval(refresh, 400);
 refresh();
-
-// slider drag tracking to avoid jitter while refreshing
-slider.addEventListener('pointerdown', () => { sliderDragging = true; });
-slider.addEventListener('pointerup', () => { sliderDragging = false; });
-slider.addEventListener('pointercancel', () => { sliderDragging = false; });
 </script>
 </body></html>
 )HTML";
@@ -1171,6 +1129,8 @@ void updateAlarmLogic() {
 
   alarmActive = any;
   alarmLevel = newLevel;
+
+  if (!autoMode) return;
 
   if (alarmMuted && millis() > alarmMutedUntil) {
     alarmMuted = false;
