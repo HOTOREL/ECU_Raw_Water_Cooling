@@ -20,8 +20,10 @@
 #define RELAY_ALARM  10   // GPIO10 -> Alarm relay (NC strategy)
 
 // ================= USER CALIBRATION / TUNING =================
-// Flow sensor label: F(Hz) = 5.5 * Q(L/min)  => Q = Hz / 5.5
-const float FLOW_K_HZ_PER_LMIN = 5.5f;
+// Flow sensor label: F(Hz) = 5.5 * Q(L/min)  => 330 pulses per liter (tune with FLOW_CAL_SCALE if needed)
+const float FLOW_PULSES_PER_LITER = 330.0f;    // datasheet value
+const float FLOW_HZ_PER_LMIN      = FLOW_PULSES_PER_LITER / 60.0f; // 5.5 Hz per L/min
+const float FLOW_CAL_SCALE        = 4.0f;      // empirical correction (1.7 L/min target filled 1.7 L in ~15 s)
 
 // Hall RPM: 2 magnets on crank => 2 pulses per revolution (counting ONE edge only)
 const float RPM_PULSES_PER_REV = 2.0f;
@@ -423,10 +425,6 @@ String pageHTML() {
       <div>Calibration</div>
       <div id="calStatus" class="mono">OK</div>
     </div>
-    <div class="row small">
-      <div>Alarm Relay</div>
-      <div id="relayStatus" class="mono">Open</div>
-    </div>
   </div>
 
   <div class="card">
@@ -455,6 +453,7 @@ String pageHTML() {
     <div class="row big"><div>X9C (pos)</div><div class="mono" id="x9c">?</div></div>
 
     <div class="row big"><div>Alarm</div><div class="mono value" id="alarm">?</div></div>
+    <div class="row big"><div>Alarm Relay Power (On/Off)</div><div class="mono value" id="relayStatus">?</div></div>
   </div>
 
   <div class="card">
@@ -547,8 +546,8 @@ async function refresh(){
     modeBtn.classList.toggle("manual", !currentAutoMode);
     modeStatus.textContent = currentAutoMode ? "Auto mode" : "Manual mode";
 
-    const relayOpen = !!d.alarmRelaySilenced;
-    relayStatus.textContent = relayOpen ? "Open (silenced)" : "Closed (alarming)";
+    const relayPowered = !!d.alarmRelaySilenced;
+    relayStatus.textContent = relayPowered ? "On" : "Off";
 
     const manual = !currentAutoMode;
     sliderEl.disabled = !manual || d.calibrating;
@@ -927,7 +926,7 @@ void updateFlow() {
   float hz = (dtMs > 0) ? (dp * 1000.0f / dtMs) : 0.0f;
   flowHz_x100 = (uint32_t)(hz * 100.0f + 0.5f);
 
-  float qLmin = hz / FLOW_K_HZ_PER_LMIN;
+  float qLmin = (hz / FLOW_HZ_PER_LMIN) * FLOW_CAL_SCALE;
   if (qLmin < 0) qLmin = 0;
   if (FLOW_CLAMP_LMIN > 0 && qLmin > FLOW_CLAMP_LMIN) qLmin = FLOW_CLAMP_LMIN;
 
