@@ -105,6 +105,8 @@ int  alarmLevel  = 0;            // 0 none, 1 warn, 2 high, 3 crit
 bool alarmMuted  = false;
 uint32_t alarmMutedUntil = 0;
 bool alarmRelaySilenced = true;  // energized = silent
+bool manualAlarmOverride = false;
+bool manualAlarmShouldSound = false;
 
 // Flow faults
 bool flowRestrictFault = false;
@@ -412,11 +414,18 @@ String pageHTML() {
     </div>
     <div class="row small">
       <div>Mode</div>
-      <div><button id="modeBtn" class="mode-btn" onclick="toggleMode()">Auto</button></div>
+      <div>
+        <span id="modeStatus" class="mono" style="margin-right:6px;">Auto mode</span>
+        <button id="modeBtn" class="mode-btn" onclick="toggleMode()">Change mode</button>
+      </div>
     </div>
     <div class="row small">
       <div>Calibration</div>
       <div id="calStatus" class="mono">OK</div>
+    </div>
+    <div class="row small">
+      <div>Alarm Relay</div>
+      <div id="relayStatus" class="mono">Open</div>
     </div>
   </div>
 
@@ -483,6 +492,17 @@ function applyLevel(el, level){
   else if (level === 1) el.classList.add("warn");
 }
 
+let currentAutoMode = true;
+let sliderActive = false;
+let pendingPwmValue = null;
+let sendingPwm = false;
+
+const sliderEl = document.getElementById("slider");
+sliderEl.addEventListener("pointerdown", () => { sliderActive = true; });
+sliderEl.addEventListener("pointerup",   () => { sliderActive = false; });
+sliderEl.addEventListener("pointercancel", () => { sliderActive = false; });
+sliderEl.addEventListener("pointerleave",  () => { sliderActive = false; });
+
 async function refresh(){
   try{
     const r = await fetch('/data', {cache: "no-store"});
@@ -522,11 +542,16 @@ async function refresh(){
     const calClass = d.calFail ? "error" : (d.calOk ? "ok" : "warn");
     calStatus.className = "mono " + calClass;
 
-    modeBtn.textContent = d.autoMode ? "Auto" : "Manual";
-    modeBtn.classList.toggle("manual", !d.autoMode);
+    currentAutoMode = !!d.autoMode;
+    modeBtn.textContent = "Change mode";
+    modeBtn.classList.toggle("manual", !currentAutoMode);
+    modeStatus.textContent = currentAutoMode ? "Auto mode" : "Manual mode";
 
-    const manual = !d.autoMode;
-    slider.disabled = !manual || d.calibrating;
+    const relayOpen = !!d.alarmRelaySilenced;
+    relayStatus.textContent = relayOpen ? "Open (silenced)" : "Closed (alarming)";
+
+    const manual = !currentAutoMode;
+    sliderEl.disabled = !manual || d.calibrating;
     calibBtn.disabled = !manual || d.calibrating;
     restoreBtn.disabled = !manual || d.calibrating;   // ONLY manual mode
     restoreBtn.style.display = manual ? "inline" : "none";
@@ -539,7 +564,7 @@ async function refresh(){
     }
 
     sval.textContent  = d.pwm;
-    slider.value      = d.pwm;
+    if (!sliderActive) sliderEl.value = d.pwm;
 
     // cal table display
     if (Array.isArray(d.cal) && d.cal.length === 9) {
@@ -565,12 +590,26 @@ async function refresh(){
 }
 
 async function setPWM(v){
-  sval.textContent = v;
-  await fetch('/set?pwm=' + v);
+  const val = Number(v);
+  sval.textContent = val;
+  pendingPwmValue = val;
+  if (sendingPwm) return;
+
+  sendingPwm = true;
+  while (pendingPwmValue !== null) {
+    const next = pendingPwmValue;
+    pendingPwmValue = null;
+    try {
+      await fetch('/set?pwm=' + next);
+    } catch(e) {
+      // swallow
+    }
+  }
+  sendingPwm = false;
 }
 
 async function toggleMode(){
-  const wantManual = modeBtn.textContent.toLowerCase() === "auto";
+  const wantManual = currentAutoMode;
   await fetch('/set?mode=' + (wantManual ? 'manual' : 'auto'));
 }
 
@@ -766,17 +805,19 @@ void handleSet() {
     String m = server.arg("mode");
     if (m == "manual") {
       autoMode = false;
-      setAlarmSilenced(true);
+      manualAlarmOverride = false;
     } else if (m == "auto") {
       autoMode = true;
+      manualAlarmOverride = false;
     }
   }
 
   if (server.hasArg("alarm")) {
     String val = server.arg("alarm");
     if (!autoMode) {
-      if (val == "on") setAlarmSilenced(false);
-      else            setAlarmSilenced(true);
+      manualAlarmOverride = true;
+      manualAlarmShouldSound = (val == "on");
+      setAlarmSilenced(!manualAlarmShouldSound);
     }
   }
 
@@ -1017,33 +1058,39 @@ void updateTemps() {
 }
 
 void updatePumpControlAndFlowChecks() {
-  if (!autoMode || calibrating) return;
+  if (calibrating) return;
 
   int targetPwm = 0;
   bool engineRunning = (fuelActive && rpmValue > ENGINE_RPM_MIN);
 
-  if (engineRunning) {
-    float rpmClamped = rpmValue;
-    if (rpmClamped > PUMP_RPM_MAX) rpmClamped = PUMP_RPM_MAX;
-    if (rpmClamped < ENGINE_RPM_MIN) rpmClamped = ENGINE_RPM_MIN;
+  if (autoMode) {
+    if (engineRunning) {
+      float rpmClamped = rpmValue;
+      if (rpmClamped > PUMP_RPM_MAX) rpmClamped = PUMP_RPM_MAX;
+      if (rpmClamped < ENGINE_RPM_MIN) rpmClamped = ENGINE_RPM_MIN;
 
-    float fraction = (rpmClamped - ENGINE_RPM_MIN) / float(PUMP_RPM_MAX - ENGINE_RPM_MIN);
-    float basePwmF = PUMP_PWM_MIN + fraction * float(PUMP_PWM_MAX - PUMP_PWM_MIN);
-    basePwmF = constrain(basePwmF, 0.0f, 99.0f);
-    targetPwm = int(basePwmF + 0.5f);
+      float fraction = (rpmClamped - ENGINE_RPM_MIN) / float(PUMP_RPM_MAX - ENGINE_RPM_MIN);
+      float basePwmF = PUMP_PWM_MIN + fraction * float(PUMP_PWM_MAX - PUMP_PWM_MIN);
+      basePwmF = constrain(basePwmF, 0.0f, 99.0f);
+      targetPwm = int(basePwmF + 0.5f);
 
-    if (!boostActive && isNum(tMix) && tMix >= MIX_HIGH_C) boostActive = true;
-    if (boostActive && isNum(tMix) && tMix <= (MIX_HIGH_C - 5.0f)) boostActive = false;
+      if (!boostActive && isNum(tMix) && tMix >= MIX_HIGH_C) boostActive = true;
+      if (boostActive && isNum(tMix) && tMix <= (MIX_HIGH_C - 5.0f)) boostActive = false;
 
-    if (isNum(tMix) && tMix >= MIX_CRIT_C) targetPwm = 99;
-    else if (boostActive) targetPwm = min(99, targetPwm + 10);
+      if (isNum(tMix) && tMix >= MIX_CRIT_C) targetPwm = 99;
+      else if (boostActive) targetPwm = min(99, targetPwm + 10);
+    } else {
+      targetPwm = 0;
+      boostActive = false;
+    }
   } else {
-    targetPwm = 0;
+    targetPwm = pwmCmd;
     boostActive = false;
   }
 
+  int effectivePwm = autoMode ? targetPwm : pwmCmd;
   uint32_t now = millis();
-  bool pumpShouldBeOn = (targetPwm >= PUMP_PWM_MIN);
+  bool pumpShouldBeOn = (effectivePwm >= PUMP_PWM_MIN);
 
   // NO FLOW (pump ON but flow below threshold for long enough)
   if (pumpShouldBeOn) {
@@ -1080,7 +1127,7 @@ void updatePumpControlAndFlowChecks() {
 
   // Restriction (only if calibration complete)
   if (calibrateComplete && pumpShouldBeOn && !flowNoMoveFault) {
-    float expF = expectedFlowFromCal(targetPwm);
+    float expF = expectedFlowFromCal(effectivePwm);
     if (isNum(expF) && expF > 0.1f) {
       if (flow_Lmin < expF * FLOW_RESTRICT_RATIO) {
         if (flowRestrictSince == 0) flowRestrictSince = now;
@@ -1098,8 +1145,10 @@ void updatePumpControlAndFlowChecks() {
     flowRestrictFault = false;
   }
 
-  pwmCmd = targetPwm;
-  x9cSet(pwmCmd);
+  if (autoMode) {
+    pwmCmd = targetPwm;
+    x9cSet(pwmCmd);
+  }
 }
 
 void updateAlarmLogic() {
@@ -1130,16 +1179,13 @@ void updateAlarmLogic() {
   alarmActive = any;
   alarmLevel = newLevel;
 
-  if (!autoMode) return;
+  if (autoMode && manualAlarmOverride) {
+    manualAlarmOverride = false;
+  }
 
   if (alarmMuted && millis() > alarmMutedUntil) {
     alarmMuted = false;
     alarmMutedUntil = 0;
-  }
-
-  if (!alarmActive) {
-    setAlarmSilenced(true);
-    return;
   }
 
   bool shouldSound = false;
@@ -1151,16 +1197,23 @@ void updateAlarmLogic() {
     levelStartTime = millis();
   }
 
-  if (alarmLevel >= 3) {
-    shouldSound = true; // continuous
-  } else {
-    uint32_t elapsed = millis() - levelStartTime;
-    uint32_t cycle = elapsed % 30000UL;
-    if (alarmLevel == 2) shouldSound = (cycle < 3000UL);
-    if (alarmLevel == 1) shouldSound = (cycle < 1000UL);
+  if (alarmActive) {
+    if (alarmLevel >= 3) {
+      shouldSound = true; // continuous
+    } else {
+      uint32_t elapsed = millis() - levelStartTime;
+      uint32_t cycle = elapsed % 30000UL;
+      if (alarmLevel == 2) shouldSound = (cycle < 3000UL);
+      if (alarmLevel == 1) shouldSound = (cycle < 1000UL);
+    }
   }
 
-  if (alarmMuted) shouldSound = false;
+  if (alarmMuted && !manualAlarmOverride) shouldSound = false;
+
+  if (!autoMode && manualAlarmOverride) {
+    shouldSound = manualAlarmShouldSound;
+  }
+
   setAlarmSilenced(!shouldSound);
 }
 
