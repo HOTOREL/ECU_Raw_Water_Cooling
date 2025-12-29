@@ -23,7 +23,7 @@
 // Flow sensor label: F(Hz) = 5.5 * Q(L/min)  => 330 pulses per liter (tune with FLOW_CAL_SCALE if needed)
 const float FLOW_PULSES_PER_LITER = 330.0f;    // datasheet value
 const float FLOW_HZ_PER_LMIN      = FLOW_PULSES_PER_LITER / 60.0f; // 5.5 Hz per L/min
-const float FLOW_CAL_SCALE        = 4.0f;      // empirical correction (1.7 L/min target filled 1.7 L in ~15 s)
+const float FLOW_CAL_SCALE        = 1.0f;      // empirical correction (1.7 L/min target filled 1.7 L in ~15 s)
 
 // Hall RPM: 2 magnets on crank => 2 pulses per revolution (counting ONE edge only)
 const float RPM_PULSES_PER_REV = 2.0f;
@@ -130,7 +130,7 @@ float calFlowLmin[CAL_STEPS];
 
 // Built-in default calibration (dummy safe placeholders; replace later with your real “factory defaults”)
 float DEFAULT_CAL_FLOW_LMIN[CAL_STEPS] = {
-  0.5f, 1.2f, 2.1f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f
+  0.0f, 1.0f, 3.3f, 5.3f, 7.4f, 9.5f, 11.4f, 13.3f, 15.8f
 };
 
 bool  calibrateComplete = false;      // “valid and usable for restriction logic”
