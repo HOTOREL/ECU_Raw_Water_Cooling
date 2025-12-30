@@ -157,9 +157,6 @@ float    flowCalAccum = 0.0f;
 uint32_t flowCalCount = 0;
 int      flowCalBadCount = 0;
 
-// Pump boost
-bool boostActive = false;
-
 // ================= Calibration table =================
 const int CAL_STEPS = 9;
 int   calPwmStep[CAL_STEPS] = {20,30,40,50,60,70,80,90,100};
@@ -369,6 +366,16 @@ float autoFlowTargetFromRpm(float rpm) {
   if (q < 6.0f) q = 6.0f;
   if (q > 45.0f) q = 45.0f;
   return q;
+}
+
+float tempFlowBiasFromMix(float tMix) {
+  if (!isNum(tMix)) return 0.0f;
+  if (tMix >= MIX_CRIT_C) return 1e9f;
+  if (tMix <= MIX_HIGH_C) return 0.0f;
+
+  float t = (tMix - MIX_HIGH_C) / (MIX_CRIT_C - MIX_HIGH_C);
+  t = constrain(t, 0.0f, 1.0f);
+  return 15.0f * t;
 }
 
 void resetManualFlowControl(bool clearTarget) {
@@ -1301,7 +1308,17 @@ void updatePumpControlAndFlowChecks() {
 
   if (autoMode) {
     if (engineRunning) {
-      float targetFlow = autoFlowTargetFromRpm(rpmValue);
+      float baseFlow = autoFlowTargetFromRpm(rpmValue);
+      float bias = tempFlowBiasFromMix(tMix);
+
+      float targetFlow;
+      if (bias > 1e8f) {
+        targetFlow = FLOW_TARGET_MAX_LMIN;
+      } else {
+        targetFlow = baseFlow + bias;
+        targetFlow = constrain(targetFlow, 0.0f, FLOW_TARGET_MAX_LMIN);
+      }
+
       if (!manualFlowControlActive || fabsf(targetFlow - manualFlowTargetLmin) > FLOW_CONTROL_HYST) {
         manualFlowTargetChanged = true;
       }
@@ -1310,19 +1327,11 @@ void updatePumpControlAndFlowChecks() {
 
       pwmCmd = updateManualFlowControl(now);
       targetPwm = pwmCmd;
-
-      if (!boostActive && isNum(tMix) && tMix >= MIX_HIGH_C) boostActive = true;
-      if (boostActive && isNum(tMix) && tMix <= (MIX_HIGH_C - 5.0f)) boostActive = false;
-
-      if (isNum(tMix) && tMix >= MIX_CRIT_C) targetPwm = 99;
-      else if (boostActive) targetPwm = min(99, targetPwm + 10);
     } else {
       targetPwm = 0;
-      boostActive = false;
       resetManualFlowControl(true);
     }
   } else {
-    boostActive = false;
     if (manualFlowControlActive && manualFlowTargetLmin > FLOW_CONTROL_HYST) {
       pwmCmd = updateManualFlowControl(now);
     }
