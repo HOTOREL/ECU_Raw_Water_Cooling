@@ -32,7 +32,7 @@ const float RPM_PULSES_PER_REV = 2.0f;
 const int ENGINE_RPM_MIN = 800;  // <<<<< change this if needed
 
 // ===== Pump command mapping =====
-const int PUMP_PWM_MIN = 35;      // minimum command when pump should be on (you can tune later)
+const int PUMP_PWM_MIN = 10;      // minimum command when pump should be on (you can tune later)
 const int PUMP_PWM_MAX = 99;
 const int PUMP_RPM_MAX = 5000;
 
